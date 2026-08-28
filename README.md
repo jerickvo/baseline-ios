@@ -1,1 +1,188 @@
-# baseline-ios
+# BaselineLogger
+
+A raw sensor data collection tool for iOS 16+, written in Swift and SwiftUI.
+
+BaselineLogger records device motion, raw accelerometer, and GPS streams to
+CSV files during a run, with the phone locked in a running belt at the lower
+back. The CSVs are pulled onto a laptop and analyzed in Python later. That is
+the entire scope: **no analysis, no charts, no metrics, no step detection, no
+filtering happen on the phone.** Raw values only — nothing is smoothed,
+resampled, or interpolated on write.
+
+Data continuity is the top priority. The app tracks inter-sample gaps and
+reports them prominently, because a session with dropped samples is worthless.
+
+## Project layout
+
+```
+BaselineLogger.xcodeproj/
+BaselineLogger/
+  BaselineLoggerApp.swift        App entry point
+  Info.plist                     Permissions, background mode, file sharing
+  Models/SessionMetadata.swift   session.json schema + display formatting
+  Recording/CSVWriter.swift      Buffered FileHandle CSV writer (flat memory)
+  Recording/GapTracker.swift     Inter-sample gap detection
+  Recording/SessionRecorder.swift  The capture engine (motion / accel / GPS)
+  Storage/SessionStore.swift     Scans Documents for recorded sessions
+  Storage/SessionArchive.swift   Session folder -> zip for the share sheet
+  Views/RootView.swift           Tab container
+  Views/RecordView.swift         Label field, start/stop, live counters, Mark Event
+  Views/SessionSummaryView.swift End-of-session summary (gaps shown here)
+  Views/SessionListView.swift    All sessions, warning icon when gaps > 0
+  Views/SessionDetailView.swift  Full metadata + zip export
+```
+
+## Building
+
+1. Open `BaselineLogger.xcodeproj` in Xcode 15 or later.
+2. In **Signing & Capabilities**, pick your team and change the bundle
+   identifier (`com.example.BaselineLogger`) to something in your namespace.
+3. Build to a physical device. Sensors and background execution do not work
+   in the simulator.
+
+### Capabilities and Info.plist
+
+Everything required is already configured in `BaselineLogger/Info.plist`;
+nothing needs to be added by hand. For reference:
+
+| Key | Why |
+| --- | --- |
+| `NSMotionUsageDescription` | Motion data usage string. |
+| `NSLocationWhenInUseUsageDescription` | First step of the permission ladder. |
+| `NSLocationAlwaysAndWhenInUseUsageDescription` | Always access — required for recording to survive the screen locking. |
+| `UIBackgroundModes = [location]` | **Do not remove.** CoreMotion has no background mode of its own. The active background location session is the only thing that keeps the app running — and motion callbacks flowing — once the screen locks. Removing this silently kills every recording at screen-off. |
+| `UIFileSharingEnabled` | Exposes Documents in Finder device file sharing. |
+| `LSSupportsOpeningDocumentsInPlace` | Exposes Documents in the Files app. |
+
+The **Background Modes → Location updates** capability in Signing &
+Capabilities is just a UI over `UIBackgroundModes`; it should show as enabled
+when you open the project.
+
+### How background capture works
+
+With the screen off, iOS suspends apps and motion updates stop **with no
+error**. BaselineLogger stays alive by:
+
+1. Requesting **Always** location authorization (two-step ladder: When-In-Use
+   first, then Always).
+2. Starting a continuous location session (`kCLLocationAccuracyBest`,
+   `allowsBackgroundLocationUpdates = true`,
+   `pausesLocationUpdatesAutomatically = false`) **before** motion updates,
+   and keeping it running for the full session.
+3. Holding a `UIApplication` background task assertion as a secondary
+   fallback (worth ~30 seconds on its own; the location session does the real
+   work).
+
+The idle timer is deliberately not disabled — the screen is supposed to turn
+off. On first run, grant location access, and when iOS later asks to upgrade
+to "Always Allow", accept — otherwise recording dies when the phone locks.
+
+## Recording protocol
+
+- Type a session label before starting (e.g. `normal 3mi`,
+  `heel lift left 3mi`). Labels drive the downstream validation protocol.
+- **Mark Event** appends a timestamped marker with an optional note — drop
+  markers at lap boundaries. Markers land in `session.json`, on the same
+  timeline as the CSV `t` column.
+- When you stop, a summary shows duration, sample counts, achieved rates,
+  gap count, and largest gap. **If gap count is non-zero, distrust the
+  session** before building analysis on it.
+
+## Pulling data off the device
+
+One folder per session in the app's Documents directory, named with an ISO
+8601 basic-format UTC timestamp (e.g. `20260828T134502Z` — the basic format
+avoids `:` characters, which file systems and Finder handle badly). Each
+folder contains `motion.csv`, `accel_raw.csv`, `gps.csv`, `session.json`.
+
+Three ways to get the folders:
+
+1. **Finder (macOS):** connect the phone, select it in the sidebar, open the
+   **Files** tab, expand **BaselineLogger**, and drag session folders out.
+2. **Files app (on the phone):** On My iPhone → BaselineLogger. Useful for
+   quick checks or copying to iCloud Drive.
+3. **Share sheet:** Sessions tab → session → **Export Session Zip** — zips
+   the folder and hands it to AirDrop / Mail / etc.
+
+## CSV column definitions
+
+All three files share the `t` column: seconds since session start, printed
+with 6 decimal places. For `motion.csv` and `accel_raw.csv`, `t` comes from
+the sample's own hardware timestamp (seconds-since-boot clock), so
+inter-sample deltas are exact. For `gps.csv`, `t` is derived from the fix's
+wall-clock timestamp relative to session start — fixes are timestamped at
+measurement, not delivery. The two clocks agree to within a few
+milliseconds at session start; a mid-session NTP clock adjustment could
+shift GPS `t` slightly, never motion/accel `t`.
+
+### motion.csv — fused device motion, requested at 100 Hz
+
+`CMMotionManager.startDeviceMotionUpdates`, reference frame
+`.xArbitraryZVertical` (gravity pins Z; X arbitrary; no magnetometer).
+
+| Column | Meaning | Units |
+| --- | --- | --- |
+| `t` | Seconds since session start | s |
+| `ax ay az` | `userAcceleration` — gravity already removed | g |
+| `gx gy gz` | `gravity` vector | g |
+| `rx ry rz` | `rotationRate` (bias-corrected) | rad/s |
+| `qw qx qy qz` | `attitude` quaternion (device → reference frame) | unitless |
+
+### accel_raw.csv — raw accelerometer, requested at 200 Hz
+
+Unfused and **includes gravity**. Exists because impact rise time lives in
+high-frequency content that 100 Hz device motion smooths out; used only for
+impact shape. Some devices will not sustain 200 Hz — the stream records
+whatever arrives, and the achieved rate is in `session.json`.
+
+| Column | Meaning | Units |
+| --- | --- | --- |
+| `t` | Seconds since session start | s |
+| `ax ay az` | Raw acceleration, gravity included | g |
+
+### gps.csv — CLLocationManager, best accuracy, ~1 Hz
+
+| Column | Meaning | Units |
+| --- | --- | --- |
+| `t` | Seconds since session start (fix timestamp) | s |
+| `latitude` / `longitude` | WGS-84 coordinate | degrees |
+| `speed` | Instantaneous ground speed; **-1 when invalid** (raw, unfiltered) | m/s |
+| `horizontalAccuracy` | Radius of uncertainty; negative when invalid | m |
+| `altitude` | Above mean sea level | m |
+
+### session.json
+
+| Field | Meaning |
+| --- | --- |
+| `id` | UUID for the session |
+| `label` | The label typed on the Record screen |
+| `startTime` / `endTime` | ISO 8601 wall-clock timestamps |
+| `durationSeconds` | Measured on the monotonic clock |
+| `motionSampleCount` / `accelSampleCount` / `gpsSampleCount` | Rows written per CSV |
+| `achievedMotionHz` / `achievedAccelHz` | sample count / duration — compare against 100 / 200 |
+| `deviceModel` | Hardware identifier, e.g. `iPhone15,2` |
+| `iosVersion` | e.g. `17.5.1` |
+| `motionGapCount` / `accelGapCount` | Number of gaps per stream (see below) |
+| `largestGapSeconds` | Largest single gap across both streams |
+| `eventMarkers` | Array of `{t, note}` on the CSV `t` timeline |
+
+**Gap definition:** any delta between consecutive sample timestamps greater
+than **3× the requested interval** (motion: > 30 ms, raw accel: > 15 ms)
+counts as one gap. Gap counts and the largest gap are shown on screen the
+moment a session ends and flagged with a warning icon in the session list.
+
+Loading in Python:
+
+```python
+import pandas as pd
+motion = pd.read_csv("20260828T134502Z/motion.csv")
+```
+
+## Constraints (by design)
+
+- No analysis, charts, gait metrics, step detection, or filtering.
+- No backend, no network calls, no accounts.
+- No third-party dependencies: Foundation, SwiftUI, CoreMotion, CoreLocation
+  only. (Zip export uses `NSFileCoordinator`'s `.forUploading` — the one
+  folder-to-zip facility built into Foundation.)
+- Raw values on write, always.
