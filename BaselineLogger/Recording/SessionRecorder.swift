@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import CoreMotion
 import CoreLocation
 import UIKit
@@ -117,9 +118,16 @@ final class SessionRecorder: NSObject, ObservableObject {
             self.accelWriter = try CSVWriter(
                 url: folderURL.appendingPathComponent("accel_raw.csv"),
                 header: "t,ax,ay,az")
+            // The 500-row buffer exists to keep memory flat on the high-rate
+            // streams (it flushes every 5 s at 100 Hz, every 2.5 s at 200 Hz).
+            // GPS arrives at ~1 Hz, so 500 rows would mean 8+ minutes of fixes
+            // sitting unflushed — a pure data-loss window if iOS jetsams the
+            // app mid-run, with no memory benefit to show for it. 3,600 rows
+            // is the whole session; 10 caps the exposure at ~10 seconds.
             self.gpsWriter = try CSVWriter(
                 url: folderURL.appendingPathComponent("gps.csv"),
-                header: "t,latitude,longitude,speed,horizontalAccuracy,altitude")
+                header: "t,latitude,longitude,speed,horizontalAccuracy,altitude",
+                flushThreshold: 10)
         }
     }
 
@@ -167,14 +175,26 @@ final class SessionRecorder: NSObject, ObservableObject {
     func startSession(label: String) {
         guard !isRecording else { return }
         lastError = nil
+        // Held outside the do block so the catch can still delete a folder
+        // created before a later step threw. Reading it back off `active` does
+        // not work: `active` is assigned only after the last throwing call, so
+        // it is always nil by the time the catch runs.
+        var createdFolder: URL?
         do {
+            // Read both clocks back to back, BEFORE any disk I/O. motion/accel
+            // `t` is measured from startUptime and GPS `t` from startDate, so
+            // anything between these two lines (creating the folder and three
+            // files takes milliseconds) becomes a fixed skew between the
+            // streams that nothing downstream can recover.
             let startDate = Date()
+            let startUptime = ProcessInfo.processInfo.systemUptime
             let folderURL = try Self.makeSessionFolder(startDate: startDate)
+            createdFolder = folderURL
             let session = try ActiveSession(
                 label: label,
                 folderURL: folderURL,
                 startDate: startDate,
-                startUptime: ProcessInfo.processInfo.systemUptime)
+                startUptime: startUptime)
             active = session
 
             // Secondary fallback only — see beginBackgroundAssertion().
@@ -199,7 +219,7 @@ final class SessionRecorder: NSObject, ObservableObject {
             startUITimer()
         } catch {
             lastError = "Could not start session: \(error.localizedDescription)"
-            cleanupAfterFailedStart()
+            cleanupAfterFailedStart(folderURL: createdFolder)
         }
     }
 
@@ -283,12 +303,17 @@ final class SessionRecorder: NSObject, ObservableObject {
         session.eventMarkers.append(EventMarker(t: t, note: note))
     }
 
-    private func cleanupAfterFailedStart() {
+    /// `folderURL` is the session folder if one was created before the failure
+    /// — e.g. a CSVWriter init threw on a full disk, leaving the directory and
+    /// possibly a zero-byte motion.csv behind. Remove it: Documents is exposed
+    /// through Files and Finder, so a stub folder there reads like a real
+    /// session that lost its data.
+    private func cleanupAfterFailedStart(folderURL: URL?) {
         motionManager.stopDeviceMotionUpdates()
         motionManager.stopAccelerometerUpdates()
         locationManager.stopUpdatingLocation()
         endBackgroundAssertion()
-        if let folderURL = active?.folderURL {
+        if let folderURL {
             try? FileManager.default.removeItem(at: folderURL)
         }
         active = nil

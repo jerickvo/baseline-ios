@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 /// A finished session on disk: parsed metadata plus the folder that holds its
 /// CSVs.

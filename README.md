@@ -21,6 +21,8 @@ BaselineLogger/
   Info.plist                     Permissions, background mode, file sharing
   Models/SessionMetadata.swift   session.json schema + display formatting
   Recording/CSVWriter.swift      Buffered FileHandle CSV writer (flat memory)
+                                 500-row buffer on the high-rate streams;
+                                 GPS uses 10 (see "Buffering" below)
   Recording/GapTracker.swift     Inter-sample gap detection
   Recording/SessionRecorder.swift  The capture engine (motion / accel / GPS)
   Storage/SessionStore.swift     Scans Documents for recorded sessions
@@ -77,6 +79,26 @@ The idle timer is deliberately not disabled — the screen is supposed to turn
 off. On first run, grant location access, and when iOS later asks to upgrade
 to "Always Allow", accept — otherwise recording dies when the phone locks.
 
+### Buffering and what a crash costs you
+
+Rows are built into a string buffer and flushed to disk through a
+`FileHandle`; the buffer is reused, so memory stays flat regardless of session
+length. Nothing is ever held for the whole session — a 60 minute run is
+360,000 motion rows and 720,000 raw accel rows.
+
+The flush threshold is 500 rows on the two high-rate streams, which is what
+keeps their memory flat: that is a flush every 5 s at 100 Hz and every 2.5 s
+at 200 Hz. GPS is the exception, at 10 rows. At ~1 Hz a 500-row buffer would
+hold 8+ minutes of fixes in memory, so if iOS jetsams the app mid-run you
+would lose 8 minutes of GPS — all downside, and no memory saving to show for
+it, since the entire session is only ~3,600 GPS rows. Ten rows caps the
+exposure at ~10 seconds. If you want it uniform, it is the one
+`flushThreshold: 10` argument in `SessionRecorder.ActiveSession.init`.
+
+An unexpected termination also means no `session.json` is written, so the
+folder will not appear in the Sessions list — the CSVs are still on disk and
+still reachable through the Files app and Finder.
+
 ## Recording protocol
 
 - Type a session label before starting (e.g. `normal 3mi`,
@@ -111,9 +133,11 @@ with 6 decimal places. For `motion.csv` and `accel_raw.csv`, `t` comes from
 the sample's own hardware timestamp (seconds-since-boot clock), so
 inter-sample deltas are exact. For `gps.csv`, `t` is derived from the fix's
 wall-clock timestamp relative to session start — fixes are timestamped at
-measurement, not delivery. The two clocks agree to within a few
-milliseconds at session start; a mid-session NTP clock adjustment could
-shift GPS `t` slightly, never motion/accel `t`.
+measurement, not delivery. The two origins (`Date()` and `systemUptime`) are
+read back to back before any file is created, so the streams share a `t = 0`
+to within microseconds. A mid-session NTP clock adjustment could still shift
+GPS `t` slightly; it can never shift motion/accel `t`, which ride the
+monotonic clock.
 
 ### motion.csv — fused device motion, requested at 100 Hz
 
