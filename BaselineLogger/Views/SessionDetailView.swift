@@ -9,6 +9,14 @@ struct SessionDetailView: View {
 
     var body: some View {
         List {
+            if metadata.isIncomplete {
+                Section {
+                    Label(
+                        "Not finalized — this session is either still recording, or the app stopped before it ended. Counts, duration and gaps are as of the last 30-second update, and the CSVs end wherever the app died.",
+                        systemImage: "exclamationmark.octagon.fill")
+                    .foregroundColor(.red)
+                }
+            }
             if metadata.totalGapCount > 0 {
                 Section {
                     Label(

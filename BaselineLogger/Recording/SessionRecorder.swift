@@ -23,6 +23,50 @@ final class LockedCounter {
     }
 }
 
+/// Thread-safe mirror of a stream's gap statistics. The GapTracker itself stays
+/// confined to its sensor queue; this is what the main thread reads for the
+/// periodic in-progress session.json writes, which would otherwise race the
+/// sensor queue mutating the tracker.
+final class LockedGapStats {
+    private let lock = NSLock()
+    private var count = 0
+    private var largest: TimeInterval = 0
+
+    func update(count: Int, largest: TimeInterval) {
+        lock.lock()
+        self.count = count
+        self.largest = largest
+        lock.unlock()
+    }
+
+    var current: (count: Int, largest: TimeInterval) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (count, largest)
+    }
+}
+
+/// Reasons a session refuses to start. Every one of these aborts the start
+/// outright: a session that cannot record motion, or cannot keep itself alive
+/// with the screen off, is worse than no session at all — it looks like a
+/// successful run until the CSVs are opened on a laptop days later.
+enum RecorderStartError: LocalizedError {
+    case locationAccessDenied
+    case deviceMotionUnavailable
+    case accelerometerUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .locationAccessDenied:
+            return "Recording needs location access. The background location session is the only thing that keeps motion capture running once the screen locks — without it iOS suspends the app and the recording silently stops. Enable Always location for BaselineLogger in Settings."
+        case .deviceMotionUnavailable:
+            return "Device motion is not available on this device, so there would be no motion.csv."
+        case .accelerometerUnavailable:
+            return "The raw accelerometer is not available on this device, so there would be no accel_raw.csv."
+        }
+    }
+}
+
 /// Records one session: 100 Hz deviceMotion, 200 Hz raw accelerometer, and
 /// ~1 Hz GPS, each streamed to its own CSV through a buffered writer.
 ///
@@ -61,6 +105,10 @@ final class SessionRecorder: NSObject, ObservableObject {
     private let accelQueue = SessionRecorder.makeSensorQueue(name: "accel-raw")
 
     private var active: ActiveSession?
+    /// Label of a start parked waiting on the authorization prompt.
+    private var pendingStartLabel: String?
+    /// UI timer ticks since the last in-progress session.json refresh.
+    private var ticksSinceMetadataWrite = 0
     private var uiTimer: Timer?
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
@@ -100,6 +148,11 @@ final class SessionRecorder: NSObject, ObservableObject {
 
         var motionGaps = GapTracker(expectedInterval: 1.0 / SessionRecorder.motionHz)
         var accelGaps = GapTracker(expectedInterval: 1.0 / SessionRecorder.accelHz)
+
+        /// Queue-safe mirrors of the two trackers above, for the periodic
+        /// in-progress metadata writes on the main thread.
+        let motionGapStats = LockedGapStats()
+        let accelGapStats = LockedGapStats()
 
         let motionCounter = LockedCounter()
         let accelCounter = LockedCounter()
@@ -172,8 +225,52 @@ final class SessionRecorder: NSObject, ObservableObject {
 
     // MARK: - Session lifecycle
 
+    /// Gate on location authorization before anything is created on disk.
+    ///
+    /// Recording without location access is not a degraded session, it is a
+    /// dead one: iOS suspends the app shortly after the screen locks and the
+    /// motion streams stop with no error and no callback. Refusing loudly here
+    /// is the only signal the user can act on — a warning banner is useless on
+    /// a screen that is off, and the failure itself is invisible until the
+    /// CSVs are opened days later.
     func startSession(label: String) {
-        guard !isRecording else { return }
+        guard !isRecording, pendingStartLabel == nil else { return }
+        switch locationManager.authorizationStatus {
+        case .denied, .restricted:
+            lastError = RecorderStartError.locationAccessDenied.localizedDescription
+            return
+        case .notDetermined:
+            // Do not start into an unknown state. Park the request and resume
+            // from locationManagerDidChangeAuthorization once the user answers.
+            lastError = nil
+            pendingStartLabel = label
+            locationManager.requestWhenInUseAuthorization()
+            return
+        default:
+            break
+        }
+        beginSession(label: label)
+    }
+
+    /// Resume a start that was waiting on the authorization prompt. Called from
+    /// the authorization delegate; a no-op unless a start is parked.
+    private func resumePendingStartIfNeeded() {
+        guard let label = pendingStartLabel else { return }
+        switch locationManager.authorizationStatus {
+        case .notDetermined:
+            return  // prompt still up; wait for the user
+        case .denied, .restricted:
+            pendingStartLabel = nil
+            lastError = RecorderStartError.locationAccessDenied.localizedDescription
+        default:
+            // When-In-Use is enough to begin; the ladder keeps trying for
+            // Always and updateAuthWarning() flags the difference.
+            pendingStartLabel = nil
+            beginSession(label: label)
+        }
+    }
+
+    private func beginSession(label: String) {
         lastError = nil
         // Held outside the do block so the catch can still delete a folder
         // created before a later step threw. Reading it back off `active` does
@@ -195,6 +292,20 @@ final class SessionRecorder: NSObject, ObservableObject {
                 folderURL: folderURL,
                 startDate: startDate,
                 startUptime: startUptime)
+
+            // Write session.json before anything starts, marked in-progress, so
+            // a run killed mid-session still leaves readable metadata and shows
+            // up in the session list. If this fails the disk is in no state to
+            // record, so let it abort the start.
+            try writeMetadata(
+                metadataSnapshot(for: session,
+                                 endDate: session.startDate,
+                                 duration: 0,
+                                 motionGaps: (count: 0, largest: 0),
+                                 accelGaps: (count: 0, largest: 0),
+                                 inProgress: true),
+                to: session.folderURL)
+
             active = session
 
             // Secondary fallback only — see beginBackgroundAssertion().
@@ -207,8 +318,11 @@ final class SessionRecorder: NSObject, ObservableObject {
             configureLocationForRecording()
             locationManager.startUpdatingLocation()
 
-            startMotionCapture(into: session)
-            startAccelCapture(into: session)
+            // Throwing here aborts the whole start through the catch below:
+            // a session missing either high-rate stream must never look like
+            // it is recording.
+            try startMotionCapture(into: session)
+            try startAccelCapture(into: session)
 
             isRecording = true
             elapsedSeconds = 0
@@ -216,6 +330,7 @@ final class SessionRecorder: NSObject, ObservableObject {
             accelSampleCount = 0
             gpsSampleCount = 0
             liveMotionHz = 0
+            ticksSinceMetadataWrite = 0
             startUITimer()
         } catch {
             lastError = "Could not start session: \(error.localizedDescription)"
@@ -249,30 +364,21 @@ final class SessionRecorder: NSObject, ObservableObject {
         let accelCount = session.accelCounter.current
         let gpsCount = session.gpsCounter.current
 
-        let metadata = SessionMetadata(
-            id: session.id,
-            label: session.label,
-            startTime: session.startDate,
-            endTime: endDate,
-            durationSeconds: duration,
-            motionSampleCount: motionCount,
-            accelSampleCount: accelCount,
-            gpsSampleCount: gpsCount,
-            achievedMotionHz: duration > 0 ? Double(motionCount) / duration : 0,
-            achievedAccelHz: duration > 0 ? Double(accelCount) / duration : 0,
-            deviceModel: Self.deviceModelIdentifier,
-            iosVersion: UIDevice.current.systemVersion,
-            motionGapCount: session.motionGaps.gapCount,
-            accelGapCount: session.accelGaps.gapCount,
-            largestGapSeconds: max(session.motionGaps.largestGapSeconds,
-                                   session.accelGaps.largestGapSeconds),
-            eventMarkers: session.eventMarkers)
+        // The queues are drained, so the trackers themselves are the
+        // authoritative final values; the locked mirrors exist for the
+        // mid-session writes.
+        let metadata = metadataSnapshot(
+            for: session,
+            endDate: endDate,
+            duration: duration,
+            motionGaps: (count: session.motionGaps.gapCount, largest: session.motionGaps.largestGapSeconds),
+            accelGaps: (count: session.accelGaps.gapCount, largest: session.accelGaps.largestGapSeconds),
+            inProgress: false)
 
+        // Rewrite session.json in full, clearing the in-progress flag written
+        // at start.
         do {
-            let data = try SessionMetadata.encoder().encode(metadata)
-            try data.write(
-                to: session.folderURL.appendingPathComponent(SessionMetadata.jsonFileName),
-                options: .atomic)
+            try writeMetadata(metadata, to: session.folderURL)
         } catch {
             lastError = "Failed to write session.json: \(error.localizedDescription)"
         }
@@ -316,15 +422,15 @@ final class SessionRecorder: NSObject, ObservableObject {
         if let folderURL {
             try? FileManager.default.removeItem(at: folderURL)
         }
+        pendingStartLabel = nil
         active = nil
     }
 
     // MARK: - Sensor streams
 
-    private func startMotionCapture(into session: ActiveSession) {
+    private func startMotionCapture(into session: ActiveSession) throws {
         guard motionManager.isDeviceMotionAvailable else {
-            lastError = "Device motion is not available on this device."
-            return
+            throw RecorderStartError.deviceMotionUnavailable
         }
         motionManager.deviceMotionUpdateInterval = 1.0 / Self.motionHz
         // .xArbitraryZVertical: gravity pins Z, X is arbitrary, and no
@@ -339,6 +445,8 @@ final class SessionRecorder: NSObject, ObservableObject {
             }
             guard let motion else { return }
             session.motionGaps.record(timestamp: motion.timestamp)
+            session.motionGapStats.update(count: session.motionGaps.gapCount,
+                                          largest: session.motionGaps.largestGapSeconds)
             let t = motion.timestamp - session.startUptime
             let a = motion.userAcceleration      // g, gravity already removed
             let g = motion.gravity               // g
@@ -351,10 +459,9 @@ final class SessionRecorder: NSObject, ObservableObject {
         }
     }
 
-    private func startAccelCapture(into session: ActiveSession) {
+    private func startAccelCapture(into session: ActiveSession) throws {
         guard motionManager.isAccelerometerAvailable else {
-            lastError = "The raw accelerometer is not available on this device."
-            return
+            throw RecorderStartError.accelerometerUnavailable
         }
         // 200 Hz requested for impact rise-time content that 100 Hz
         // deviceMotion smooths out. Some devices will not sustain 200 Hz —
@@ -370,6 +477,8 @@ final class SessionRecorder: NSObject, ObservableObject {
             }
             guard let data else { return }
             session.accelGaps.record(timestamp: data.timestamp)
+            session.accelGapStats.update(count: session.accelGaps.gapCount,
+                                         largest: session.accelGaps.largestGapSeconds)
             let t = data.timestamp - session.startUptime
             let a = data.acceleration            // g, gravity included
             session.accelWriter.appendRow(String(
@@ -446,6 +555,71 @@ final class SessionRecorder: NSObject, ObservableObject {
         accelSampleCount = session.accelCounter.current
         gpsSampleCount = session.gpsCounter.current
         liveMotionHz = elapsed > 1 ? Double(motionSampleCount) / elapsed : 0
+
+        // Refresh the in-progress session.json every 30 s so a run killed
+        // mid-session leaves metadata no more than 30 s stale.
+        ticksSinceMetadataWrite += 1
+        if ticksSinceMetadataWrite >= Self.metadataWriteTicks {
+            ticksSinceMetadataWrite = 0
+            writeInProgressMetadata(for: session, elapsed: elapsed)
+        }
+    }
+
+    /// UI timer is 0.5 s, so 60 ticks is 30 s.
+    private static let metadataWriteTicks = 60
+
+    private func writeInProgressMetadata(for session: ActiveSession, elapsed: TimeInterval) {
+        let metadata = metadataSnapshot(
+            for: session,
+            endDate: session.startDate.addingTimeInterval(elapsed),
+            duration: elapsed,
+            motionGaps: session.motionGapStats.current,
+            accelGaps: session.accelGapStats.current,
+            inProgress: true)
+        do {
+            try writeMetadata(metadata, to: session.folderURL)
+        } catch {
+            if lastError == nil {
+                lastError = "Failed to update session.json: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// Builds the metadata record. `endDate`/`duration` are "as of now" for an
+    /// in-progress write and final at stop.
+    private func metadataSnapshot(for session: ActiveSession,
+                                  endDate: Date,
+                                  duration: TimeInterval,
+                                  motionGaps: (count: Int, largest: TimeInterval),
+                                  accelGaps: (count: Int, largest: TimeInterval),
+                                  inProgress: Bool) -> SessionMetadata {
+        let motionCount = session.motionCounter.current
+        let accelCount = session.accelCounter.current
+        return SessionMetadata(
+            id: session.id,
+            label: session.label,
+            startTime: session.startDate,
+            endTime: endDate,
+            durationSeconds: duration,
+            motionSampleCount: motionCount,
+            accelSampleCount: accelCount,
+            gpsSampleCount: session.gpsCounter.current,
+            achievedMotionHz: duration > 0 ? Double(motionCount) / duration : 0,
+            achievedAccelHz: duration > 0 ? Double(accelCount) / duration : 0,
+            deviceModel: Self.deviceModelIdentifier,
+            iosVersion: UIDevice.current.systemVersion,
+            motionGapCount: motionGaps.count,
+            accelGapCount: accelGaps.count,
+            largestGapSeconds: max(motionGaps.largest, accelGaps.largest),
+            eventMarkers: session.eventMarkers,
+            inProgress: inProgress)
+    }
+
+    private func writeMetadata(_ metadata: SessionMetadata, to folderURL: URL) throws {
+        let data = try SessionMetadata.encoder().encode(metadata)
+        try data.write(
+            to: folderURL.appendingPathComponent(SessionMetadata.jsonFileName),
+            options: .atomic)
     }
 
     private func reportCaptureError(stream: String, error: Error) {
@@ -503,6 +677,7 @@ extension SessionRecorder: CLLocationManagerDelegate {
             manager.requestAlwaysAuthorization()
         }
         updateAuthWarning()
+        resumePendingStartIfNeeded()
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {

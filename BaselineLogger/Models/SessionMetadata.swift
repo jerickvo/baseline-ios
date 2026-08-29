@@ -27,6 +27,14 @@ struct SessionMetadata: Codable, Identifiable {
     var accelGapCount: Int
     var largestGapSeconds: Double
     var eventMarkers: [EventMarker]
+    /// True while the session is still recording. session.json is written once
+    /// at start and refreshed every 30 s, so a run killed mid-session still
+    /// leaves readable metadata; stop rewrites the file with this cleared.
+    ///
+    /// Optional on purpose: the synthesized decoder treats a missing key as
+    /// nil, so session.json files written before this field existed still
+    /// decode — and they are complete by definition.
+    var inProgress: Bool?
 }
 
 extension SessionMetadata {
@@ -36,6 +44,11 @@ extension SessionMetadata {
     /// session has discontinuities and the user needs to know before they
     /// build analysis on it.
     var totalGapCount: Int { motionGapCount + accelGapCount }
+
+    /// The session's metadata was never finalized — the app was killed or
+    /// crashed mid-run. Counts, duration and gaps are as of the last periodic
+    /// write (up to 30 s stale), and the CSVs end wherever the app died.
+    var isIncomplete: Bool { inProgress == true }
 
     static func encoder() -> JSONEncoder {
         let encoder = JSONEncoder()

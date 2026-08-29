@@ -10,9 +10,13 @@ struct RecordedSession: Identifiable {
 }
 
 /// Scans the Documents directory for session folders. A folder counts as a
-/// session when it contains a decodable session.json; folders without one
-/// (e.g. a session that crashed mid-recording) still hold their CSVs and stay
-/// reachable through the Files app, they just do not show up here.
+/// session when it contains a decodable session.json.
+///
+/// session.json is written at session start and refreshed every 30 s, so a
+/// session killed mid-run still appears here — carrying `inProgress`, which the
+/// list and detail screens surface as incomplete. Only a folder whose very
+/// first metadata write did not land is missing from this list; its CSVs are
+/// still on disk and reachable through the Files app.
 final class SessionStore: ObservableObject {
     @Published private(set) var sessions: [RecordedSession] = []
 

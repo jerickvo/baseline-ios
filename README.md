@@ -23,7 +23,7 @@ BaselineLogger/
   Recording/CSVWriter.swift      Buffered FileHandle CSV writer (flat memory)
                                  500-row buffer on the high-rate streams;
                                  GPS uses 10 (see "Buffering" below)
-  Recording/GapTracker.swift     Inter-sample gap detection
+  Recording/GapTracker.swift     Gap detection vs measured (not requested) rate
   Recording/SessionRecorder.swift  The capture engine (motion / accel / GPS)
   Storage/SessionStore.swift     Scans Documents for recorded sessions
   Storage/SessionArchive.swift   Session folder -> zip for the share sheet
@@ -79,6 +79,17 @@ The idle timer is deliberately not disabled — the screen is supposed to turn
 off. On first run, grant location access, and when iOS later asks to upgrade
 to "Always Allow", accept — otherwise recording dies when the phone locks.
 
+**Recording refuses to start without location access.** If authorization is
+denied or restricted, Start does nothing except show an error: there is no
+useful degraded mode, because iOS suspends the app shortly after the screen
+locks and the motion streams stop with no error and no callback. A warning
+banner would be useless on a screen that is off, so the app refuses up front
+rather than handing you a run that dies ten minutes in. If authorization has
+not been decided yet, Start waits for your answer to the prompt instead of
+beginning in an unknown state. A session also refuses to start if device
+motion or the raw accelerometer is unavailable — a session with no motion.csv
+must never look like it is recording.
+
 ### Buffering and what a crash costs you
 
 Rows are built into a string buffer and flushed to disk through a
@@ -95,9 +106,11 @@ it, since the entire session is only ~3,600 GPS rows. Ten rows caps the
 exposure at ~10 seconds. If you want it uniform, it is the one
 `flushThreshold: 10` argument in `SessionRecorder.ActiveSession.init`.
 
-An unexpected termination also means no `session.json` is written, so the
-folder will not appear in the Sessions list — the CSVs are still on disk and
-still reachable through the Files app and Finder.
+On an unexpected termination the CSVs keep whatever was flushed, and
+`session.json` keeps whatever the last periodic write recorded — it is written
+at session start and refreshed every 30 s, so the session still appears in the
+Sessions list, marked **INCOMPLETE**, rather than vanishing. Its counts,
+duration and gaps are up to 30 s stale and the CSVs end wherever the app died.
 
 ## Recording protocol
 
@@ -189,11 +202,25 @@ whatever arrives, and the achieved rate is in `session.json`.
 | `motionGapCount` / `accelGapCount` | Number of gaps per stream (see below) |
 | `largestGapSeconds` | Largest single gap across both streams |
 | `eventMarkers` | Array of `{t, note}` on the CSV `t` timeline |
+| `inProgress` | `true` while a session is unfinalized. session.json is written at start and refreshed every 30 s, so a run killed mid-session still leaves metadata; stop rewrites the file with this `false`. Absent in files written before this field existed — those are complete. |
 
 **Gap definition:** any delta between consecutive sample timestamps greater
-than **3× the requested interval** (motion: > 30 ms, raw accel: > 15 ms)
-counts as one gap. Gap counts and the largest gap are shown on screen the
-moment a session ends and flagged with a warning icon in the session list.
+than **3x the interval the stream is actually delivering** counts as one gap.
+The threshold is measured, not assumed: after a 128-delta warm-up the tracker
+takes the median observed delta and uses 3x that, recalibrating every 128
+deltas (warm-up deltas are classified retroactively, so nothing is missed).
+
+This matters because the threshold is deliberately *not* anchored to the
+requested rate. At 3x the requested 1/200 s accel interval, any device
+delivering below ~66 Hz would report every single sample as a gap — turning
+the one number you use to decide whether a session is trustworthy into noise,
+on exactly the devices the app is meant to tolerate. **A rate merely lower
+than requested is reported by `achievedAccelHz`; `accelGapCount` counts breaks
+in delivery.** Median rather than mean is also deliberate: a handful of real
+gaps in the window cannot inflate the threshold meant to detect them.
+
+Gap counts and the largest gap are shown on screen the moment a session ends
+and flagged with a warning icon in the session list.
 
 Loading in Python:
 

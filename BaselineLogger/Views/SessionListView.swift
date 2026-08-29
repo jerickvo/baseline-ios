@@ -45,6 +45,11 @@ private struct SessionRowView: View {
                 Text(session.metadata.startTime.formatted(date: .abbreviated, time: .shortened))
                     .font(.subheadline)
                     .foregroundColor(.secondary)
+                if session.metadata.isIncomplete {
+                    Text("INCOMPLETE")
+                        .font(.caption2.bold())
+                        .foregroundColor(.red)
+                }
             }
             Spacer()
             if session.metadata.totalGapCount > 0 {
