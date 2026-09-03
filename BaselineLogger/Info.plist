@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>BaselineLogger</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<!--
+	  UIFileSharingEnabled + LSSupportsOpeningDocumentsInPlace expose the
+	  Documents directory (one folder per session) in the Files app and in
+	  Finder device file sharing, so CSVs can be pulled onto a laptop without
+	  going through the share sheet every time.
+	-->
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Always access lets a recording keep running with the screen off and the phone locked. The background location session is what keeps sensor capture alive for the whole run.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>GPS position and speed are recorded alongside motion data during a session.</string>
+	<key>NSMotionUsageDescription</key>
+	<string>BaselineLogger records raw accelerometer and gyroscope data to CSV files during your runs.</string>
+	<!--
+	  DO NOT REMOVE the location background mode. CoreMotion has no background
+	  mode of its own: the active background location session is the only
+	  thing that keeps this app running (and motion updates flowing) once the
+	  screen locks. Removing this silently kills every recording at screen-off.
+	-->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+	</array>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>accelerometer</string>
+		<string>gyroscope</string>
+		<string>location-services</string>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+</dict>
+</plist>
