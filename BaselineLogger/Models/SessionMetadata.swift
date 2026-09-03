@@ -2,7 +2,8 @@ import Foundation
 
 /// One timestamped marker dropped during a session (lap boundary, condition
 /// change, etc.). `t` is seconds since session start, on the same timeline as
-/// the `t` column in motion.csv / accel_raw.csv.
+/// the `t` column in motion.csv / accel_raw.csv, captured at the moment the
+/// Mark Event button was tapped -- not when the note was finished.
 struct EventMarker: Codable {
     var t: Double
     var note: String
@@ -35,15 +36,74 @@ struct SessionMetadata: Codable, Identifiable {
     /// nil, so session.json files written before this field existed still
     /// decode — and they are complete by definition.
     var inProgress: Bool?
+
+    // Integrity counters that a gap count cannot express. All optional for
+    // the same reason as `inProgress`: older session.json files lack them.
+
+    /// Samples estimated missing from intervals that were long but below the
+    /// gap threshold (one dropped sample is a 2x interval; the gap rule needs
+    /// 3x). Zero gaps with a non-zero estimate here is a stream that is
+    /// quietly shedding samples.
+    var motionDroppedSampleEstimate: Int?
+    var accelDroppedSampleEstimate: Int?
+    /// Duplicated or reordered samples (zero or negative timestamp delta).
+    var motionNonMonotonicCount: Int?
+    var accelNonMonotonicCount: Int?
+    /// Rows the sample counters credited that never reached disk: a failed
+    /// flush discards its whole buffer, and a sample delivered after the
+    /// writer closed has nowhere to go.
+    var csvRowsLost: Int?
+    /// Cached CoreLocation fixes stamped before the session started and
+    /// therefore not written to gps.csv.
+    var gpsStaleFixesSkipped: Int?
 }
 
 extension SessionMetadata {
     static let jsonFileName = "session.json"
 
-    /// Total gaps across both high-rate streams. Anything above zero means the
-    /// session has discontinuities and the user needs to know before they
-    /// build analysis on it.
+    /// Total gaps across both high-rate streams.
     var totalGapCount: Int { motionGapCount + accelGapCount }
+
+    /// Total estimated dropped samples across both high-rate streams.
+    var totalDroppedSampleEstimate: Int {
+        (motionDroppedSampleEstimate ?? 0) + (accelDroppedSampleEstimate ?? 0)
+    }
+
+    var totalNonMonotonicCount: Int {
+        (motionNonMonotonicCount ?? 0) + (accelNonMonotonicCount ?? 0)
+    }
+
+    /// The session can be treated as continuous: no gaps, no dropped
+    /// samples the gap rule missed, no reordered samples, and every row that
+    /// was counted was written. Anything else means the user needs to know
+    /// before they build analysis on it.
+    var isContinuous: Bool {
+        totalGapCount == 0
+            && totalDroppedSampleEstimate == 0
+            && totalNonMonotonicCount == 0
+            && (csvRowsLost ?? 0) == 0
+    }
+
+    /// One-line integrity statement for the summary and list screens.
+    var integritySummary: String {
+        if isContinuous {
+            return "Continuous — no gaps, dropped samples, or lost rows detected."
+        }
+        var parts: [String] = []
+        if totalGapCount > 0 {
+            parts.append("\(totalGapCount) gap(s), largest \(SessionFormat.seconds(largestGapSeconds))")
+        }
+        if totalDroppedSampleEstimate > 0 {
+            parts.append("~\(totalDroppedSampleEstimate) dropped sample(s) below the gap threshold")
+        }
+        if totalNonMonotonicCount > 0 {
+            parts.append("\(totalNonMonotonicCount) duplicated/reordered sample(s)")
+        }
+        if let lost = csvRowsLost, lost > 0 {
+            parts.append("\(lost) row(s) never written to disk")
+        }
+        return parts.joined(separator: "; ") + ". Treat this session with suspicion."
+    }
 
     /// The session's metadata was never finalized — the app was killed or
     /// crashed mid-run. Counts, duration and gaps are as of the last periodic

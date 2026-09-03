@@ -52,7 +52,7 @@ private struct SessionRowView: View {
                 }
             }
             Spacer()
-            if session.metadata.totalGapCount > 0 {
+            if !session.metadata.isContinuous {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundColor(.orange)
             }

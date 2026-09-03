@@ -14,6 +14,20 @@ import Foundation
 /// recalibrating as the session proceeds. A rate merely lower than requested
 /// is reported by achievedAccelHz; this counts breaks in delivery.
 ///
+/// Three things are counted, because a gap count of zero was never proof of
+/// continuity:
+///
+/// - `gapCount` / `largestGapSeconds`: deltas beyond 3x the median.
+/// - `droppedSampleEstimate`: samples missing from deltas that are long but
+///   *below* the gap threshold. One dropped sample makes a 2x delta and two
+///   make exactly 3x -- the gap rule counts neither, so a stream could shed a
+///   sample every few seconds and still read "no gaps". Any delta beyond
+///   1.5x the median contributes round(delta / median) - 1 here.
+/// - `nonMonotonicCount`: zero or negative deltas -- a duplicated or
+///   reordered sample. These never enter the median window and do not
+///   advance the reference timestamp, so one cannot manufacture a fake gap
+///   on the sample after it.
+///
 /// Not internally synchronized: each tracker must only be touched from its
 /// stream's serial delivery queue.
 struct GapTracker {
@@ -23,6 +37,8 @@ struct GapTracker {
 
     private(set) var gapCount = 0
     private(set) var largestGapSeconds: TimeInterval = 0
+    private(set) var droppedSampleEstimate = 0
+    private(set) var nonMonotonicCount = 0
 
     /// Deltas observed before the first calibration. They are held rather than
     /// classified, then classified retroactively once the threshold is known,
@@ -32,25 +48,44 @@ struct GapTracker {
     /// the session length.
     private static let windowSize = 256
     private static let recalibrateEvery = 128
+    /// Multiples of the median interval: beyond `gapMultiple` is a gap;
+    /// beyond `droppedMultiple` samples are estimated missing. 1.5 sits
+    /// halfway between a normal interval (1x plus a few percent of jitter)
+    /// and one dropped sample (2x).
+    private static let gapMultiple: Double = 3
+    private static let droppedMultiple: Double = 1.5
 
     private var previousTimestamp: TimeInterval?
     private var window: [TimeInterval] = []
     private var windowNext = 0
     private var deltasSeen = 0
     private var calibrated = false
+    private var medianInterval: TimeInterval
     private var thresholdSeconds: TimeInterval
 
     init(expectedInterval: TimeInterval) {
         self.expectedInterval = expectedInterval
-        self.thresholdSeconds = expectedInterval * 3
+        self.medianInterval = expectedInterval
+        self.thresholdSeconds = expectedInterval * Self.gapMultiple
         self.window.reserveCapacity(Self.windowSize)
     }
 
     /// Feed every sample's timestamp, in seconds on any consistent clock.
     mutating func record(timestamp: TimeInterval) {
-        defer { previousTimestamp = timestamp }
-        guard let previous = previousTimestamp else { return }
+        guard let previous = previousTimestamp else {
+            previousTimestamp = timestamp
+            return
+        }
         let delta = timestamp - previous
+        // A duplicated or reordered sample: count it and keep the reference
+        // where it was, so the next genuine sample is measured against the
+        // last genuine one rather than against a timestamp that went
+        // backwards.
+        guard delta > 0 else {
+            nonMonotonicCount += 1
+            return
+        }
+        previousTimestamp = timestamp
         remember(delta)
 
         guard calibrated else {
@@ -90,11 +125,15 @@ struct GapTracker {
         guard !window.isEmpty else { return }
         let median = window.sorted()[window.count / 2]
         guard median > 0 else { return }
-        thresholdSeconds = median * 3
+        medianInterval = median
+        thresholdSeconds = median * Self.gapMultiple
         calibrated = true
     }
 
     private mutating func classify(_ delta: TimeInterval) {
+        if delta > Self.droppedMultiple * medianInterval {
+            droppedSampleEstimate += max(Int((delta / medianInterval).rounded()) - 1, 0)
+        }
         guard delta > thresholdSeconds else { return }
         gapCount += 1
         if delta > largestGapSeconds {

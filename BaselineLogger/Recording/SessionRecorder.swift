@@ -23,26 +23,57 @@ final class LockedCounter {
     }
 }
 
+/// Thread-safe one-way flag. Set once by the main thread at stop; read at the
+/// top of every sensor callback so a sample already in flight when updates
+/// were stopped cannot touch a closed writer or a tracker the main thread is
+/// reading.
+final class LockedFlag {
+    private let lock = NSLock()
+    private var flag = false
+
+    func set() {
+        lock.lock()
+        flag = true
+        lock.unlock()
+    }
+
+    var value: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return flag
+    }
+}
+
+/// Snapshot of one stream's integrity counters.
+struct GapStats {
+    var count = 0
+    var largest: TimeInterval = 0
+    var dropped = 0
+    var nonMonotonic = 0
+}
+
 /// Thread-safe mirror of a stream's gap statistics. The GapTracker itself stays
 /// confined to its sensor queue; this is what the main thread reads for the
 /// periodic in-progress session.json writes, which would otherwise race the
 /// sensor queue mutating the tracker.
 final class LockedGapStats {
     private let lock = NSLock()
-    private var count = 0
-    private var largest: TimeInterval = 0
+    private var stats = GapStats()
 
-    func update(count: Int, largest: TimeInterval) {
+    func update(from tracker: GapTracker) {
         lock.lock()
-        self.count = count
-        self.largest = largest
+        stats = GapStats(
+            count: tracker.gapCount,
+            largest: tracker.largestGapSeconds,
+            dropped: tracker.droppedSampleEstimate,
+            nonMonotonic: tracker.nonMonotonicCount)
         lock.unlock()
     }
 
-    var current: (count: Int, largest: TimeInterval) {
+    var current: GapStats {
         lock.lock()
         defer { lock.unlock() }
-        return (count, largest)
+        return stats
     }
 }
 
@@ -157,6 +188,13 @@ final class SessionRecorder: NSObject, ObservableObject {
         let motionCounter = LockedCounter()
         let accelCounter = LockedCounter()
         let gpsCounter = LockedCounter()
+        /// Cached fixes stamped before the session started, not written.
+        let gpsStaleSkipped = LockedCounter()
+
+        /// Set at the top of stopSession, before the sensor queues are
+        /// drained. Any callback that was already in flight sees it and
+        /// returns without touching the writers or trackers.
+        let stopped = LockedFlag()
 
         var eventMarkers: [EventMarker] = []
 
@@ -177,9 +215,13 @@ final class SessionRecorder: NSObject, ObservableObject {
             // sitting unflushed — a pure data-loss window if iOS jetsams the
             // app mid-run, with no memory benefit to show for it. 3,600 rows
             // is the whole session; 10 caps the exposure at ~10 seconds.
+            // speedAccuracy and verticalAccuracy are what make `speed` and
+            // `altitude` interpretable: both are negative when the value is
+            // invalid, and a pace model needs to know how much to trust
+            // each fix.
             self.gpsWriter = try CSVWriter(
                 url: folderURL.appendingPathComponent("gps.csv"),
-                header: "t,latitude,longitude,speed,horizontalAccuracy,altitude",
+                header: "t,latitude,longitude,speed,horizontalAccuracy,altitude,speedAccuracy,verticalAccuracy",
                 flushThreshold: 10)
         }
     }
@@ -207,9 +249,17 @@ final class SessionRecorder: NSObject, ObservableObject {
         case .authorizedAlways, .notDetermined:
             warning = nil
         case .authorizedWhenInUse:
-            warning = "Location is \"While Using\" only. Grant Always in Settings, or recording stops when the screen locks."
+            // With the location background mode and
+            // allowsBackgroundLocationUpdates, a session started in the
+            // foreground keeps its location updates -- and so the motion
+            // streams -- after the screen locks, with the system location
+            // indicator showing. Always is still requested because it
+            // removes that dependency on the foreground start; it is not
+            // known to be strictly required on iOS 16, and that has not
+            // been verified on a device here.
+            warning = "Location is \"While Using\" only. Recording should keep running after the screen locks (iOS shows the location indicator), but grant Always in Settings for the most reliable capture, and verify a locked-screen test run before trusting a long session."
         case .denied, .restricted:
-            warning = "Location access is denied. Recording will NOT survive the screen locking. Enable Always location in Settings."
+            warning = "Location access is denied. Recording will NOT survive the screen locking. Enable location for BaselineLogger in Settings."
         @unknown default:
             warning = nil
         }
@@ -234,14 +284,18 @@ final class SessionRecorder: NSObject, ObservableObject {
     /// a screen that is off, and the failure itself is invisible until the
     /// CSVs are opened days later.
     func startSession(label: String) {
-        guard !isRecording, pendingStartLabel == nil else { return }
+        guard !isRecording else { return }
         switch locationManager.authorizationStatus {
         case .denied, .restricted:
+            pendingStartLabel = nil
             lastError = RecorderStartError.locationAccessDenied.localizedDescription
             return
         case .notDetermined:
             // Do not start into an unknown state. Park the request and resume
             // from locationManagerDidChangeAuthorization once the user answers.
+            // If a start is already parked -- the prompt was dismissed
+            // without an answer, or never appeared -- re-request rather than
+            // swallowing the tap, and keep the newest label.
             lastError = nil
             pendingStartLabel = label
             locationManager.requestWhenInUseAuthorization()
@@ -249,6 +303,7 @@ final class SessionRecorder: NSObject, ObservableObject {
         default:
             break
         }
+        pendingStartLabel = nil
         beginSession(label: label)
     }
 
@@ -301,8 +356,9 @@ final class SessionRecorder: NSObject, ObservableObject {
                 metadataSnapshot(for: session,
                                  endDate: session.startDate,
                                  duration: 0,
-                                 motionGaps: (count: 0, largest: 0),
-                                 accelGaps: (count: 0, largest: 0),
+                                 motionGaps: GapStats(),
+                                 accelGaps: GapStats(),
+                                 rowsLost: 0,
                                  inProgress: true),
                 to: session.folderURL)
 
@@ -343,6 +399,10 @@ final class SessionRecorder: NSObject, ObservableObject {
         let endDate = Date()
         let endUptime = ProcessInfo.processInfo.systemUptime
 
+        // Raise the flag BEFORE stopping updates: CoreMotion does not promise
+        // that no callback is still queued when stop returns, and a straggler
+        // must find the flag already set.
+        session.stopped.set()
         motionManager.stopDeviceMotionUpdates()
         motionManager.stopAccelerometerUpdates()
         locationManager.stopUpdatingLocation()
@@ -364,15 +424,30 @@ final class SessionRecorder: NSObject, ObservableObject {
         let accelCount = session.accelCounter.current
         let gpsCount = session.gpsCounter.current
 
-        // The queues are drained, so the trackers themselves are the
-        // authoritative final values; the locked mirrors exist for the
-        // mid-session writes.
+        // The queues are drained and the flag is up, so the trackers
+        // themselves are the authoritative final values; the locked mirrors
+        // exist for the mid-session writes.
+        let motionStats = GapStats(
+            count: session.motionGaps.gapCount,
+            largest: session.motionGaps.largestGapSeconds,
+            dropped: session.motionGaps.droppedSampleEstimate,
+            nonMonotonic: session.motionGaps.nonMonotonicCount)
+        let accelStats = GapStats(
+            count: session.accelGaps.gapCount,
+            largest: session.accelGaps.largestGapSeconds,
+            dropped: session.accelGaps.droppedSampleEstimate,
+            nonMonotonic: session.accelGaps.nonMonotonicCount)
+        let failures = [session.motionWriter, session.accelWriter, session.gpsWriter]
+            .map { $0.failureState }
+        let rowsLost = failures.reduce(0) { $0 + $1.rowsLost }
+
         let metadata = metadataSnapshot(
             for: session,
             endDate: endDate,
             duration: duration,
-            motionGaps: (count: session.motionGaps.gapCount, largest: session.motionGaps.largestGapSeconds),
-            accelGaps: (count: session.accelGaps.gapCount, largest: session.accelGaps.largestGapSeconds),
+            motionGaps: motionStats,
+            accelGaps: accelStats,
+            rowsLost: rowsLost,
             inProgress: false)
 
         // Rewrite session.json in full, clearing the in-progress flag written
@@ -383,10 +458,8 @@ final class SessionRecorder: NSObject, ObservableObject {
             lastError = "Failed to write session.json: \(error.localizedDescription)"
         }
 
-        if session.motionWriter.writeFailed
-            || session.accelWriter.writeFailed
-            || session.gpsWriter.writeFailed {
-            lastError = "One or more CSV writes failed — this session's files may be truncated."
+        if failures.contains(where: { $0.writeFailed }) || rowsLost > 0 {
+            lastError = "CSV writes failed — \(rowsLost) row(s) never reached disk. This session's files are truncated."
         }
 
         endBackgroundAssertion()
@@ -401,11 +474,20 @@ final class SessionRecorder: NSObject, ObservableObject {
         finishedSession = metadata
     }
 
-    /// Append a timestamped marker (lap boundary, condition change). `t` is on
-    /// the same timeline as the motion CSV.
-    func markEvent(note: String) {
+    /// Seconds since session start right now, on the motion CSV timeline, or
+    /// nil when not recording. The Record screen reads this at the instant
+    /// Mark Event is tapped, so the marker is stamped before the note is
+    /// typed -- typing a note can take ten seconds, and a lap boundary
+    /// stamped ten seconds late is a lap boundary in the wrong place.
+    func currentSessionTime() -> TimeInterval? {
+        guard isRecording, let session = active else { return nil }
+        return ProcessInfo.processInfo.systemUptime - session.startUptime
+    }
+
+    /// Append a marker (lap boundary, condition change) at `t`, a value from
+    /// `currentSessionTime()` captured when the user tapped Mark Event.
+    func markEvent(at t: TimeInterval, note: String) {
         guard isRecording, let session = active else { return }
-        let t = ProcessInfo.processInfo.systemUptime - session.startUptime
         session.eventMarkers.append(EventMarker(t: t, note: note))
     }
 
@@ -443,10 +525,9 @@ final class SessionRecorder: NSObject, ObservableObject {
                 self?.reportCaptureError(stream: "deviceMotion", error: error)
                 return
             }
-            guard let motion else { return }
+            guard let motion, !session.stopped.value else { return }
             session.motionGaps.record(timestamp: motion.timestamp)
-            session.motionGapStats.update(count: session.motionGaps.gapCount,
-                                          largest: session.motionGaps.largestGapSeconds)
+            session.motionGapStats.update(from: session.motionGaps)
             let t = motion.timestamp - session.startUptime
             let a = motion.userAcceleration      // g, gravity already removed
             let g = motion.gravity               // g
@@ -475,10 +556,9 @@ final class SessionRecorder: NSObject, ObservableObject {
                 self?.reportCaptureError(stream: "accelerometer", error: error)
                 return
             }
-            guard let data else { return }
+            guard let data, !session.stopped.value else { return }
             session.accelGaps.record(timestamp: data.timestamp)
-            session.accelGapStats.update(count: session.accelGaps.gapCount,
-                                         largest: session.accelGaps.largestGapSeconds)
+            session.accelGapStats.update(from: session.accelGaps)
             let t = data.timestamp - session.startUptime
             let a = data.acceleration            // g, gravity included
             session.accelWriter.appendRow(String(
@@ -556,6 +636,18 @@ final class SessionRecorder: NSObject, ObservableObject {
         gpsSampleCount = session.gpsCounter.current
         liveMotionHz = elapsed > 1 ? Double(motionSampleCount) / elapsed : 0
 
+        // A failed flush drops 500 rows and the writer keeps going, so the
+        // counters above would keep climbing over a truncated file. Surface
+        // it the moment it happens, not at Stop.
+        if lastError == nil {
+            let lost = [session.motionWriter, session.accelWriter, session.gpsWriter]
+                .map { $0.failureState }
+            if lost.contains(where: { $0.writeFailed }) {
+                let rows = lost.reduce(0) { $0 + $1.rowsLost }
+                lastError = "A CSV write failed — \(rows) row(s) lost so far. Disk may be full; this session is truncated."
+            }
+        }
+
         // Refresh the in-progress session.json every 30 s so a run killed
         // mid-session leaves metadata no more than 30 s stale.
         ticksSinceMetadataWrite += 1
@@ -569,12 +661,15 @@ final class SessionRecorder: NSObject, ObservableObject {
     private static let metadataWriteTicks = 60
 
     private func writeInProgressMetadata(for session: ActiveSession, elapsed: TimeInterval) {
+        let rowsLost = [session.motionWriter, session.accelWriter, session.gpsWriter]
+            .reduce(0) { $0 + $1.failureState.rowsLost }
         let metadata = metadataSnapshot(
             for: session,
             endDate: session.startDate.addingTimeInterval(elapsed),
             duration: elapsed,
             motionGaps: session.motionGapStats.current,
             accelGaps: session.accelGapStats.current,
+            rowsLost: rowsLost,
             inProgress: true)
         do {
             try writeMetadata(metadata, to: session.folderURL)
@@ -590,8 +685,9 @@ final class SessionRecorder: NSObject, ObservableObject {
     private func metadataSnapshot(for session: ActiveSession,
                                   endDate: Date,
                                   duration: TimeInterval,
-                                  motionGaps: (count: Int, largest: TimeInterval),
-                                  accelGaps: (count: Int, largest: TimeInterval),
+                                  motionGaps: GapStats,
+                                  accelGaps: GapStats,
+                                  rowsLost: Int,
                                   inProgress: Bool) -> SessionMetadata {
         let motionCount = session.motionCounter.current
         let accelCount = session.accelCounter.current
@@ -604,6 +700,9 @@ final class SessionRecorder: NSObject, ObservableObject {
             motionSampleCount: motionCount,
             accelSampleCount: accelCount,
             gpsSampleCount: session.gpsCounter.current,
+            // Whole-session rate, start-up latency included. The Python side
+            // re-derives the rate from the per-sample timestamps; this is
+            // the coarse "did the stream keep up" number.
             achievedMotionHz: duration > 0 ? Double(motionCount) / duration : 0,
             achievedAccelHz: duration > 0 ? Double(accelCount) / duration : 0,
             deviceModel: Self.deviceModelIdentifier,
@@ -612,7 +711,13 @@ final class SessionRecorder: NSObject, ObservableObject {
             accelGapCount: accelGaps.count,
             largestGapSeconds: max(motionGaps.largest, accelGaps.largest),
             eventMarkers: session.eventMarkers,
-            inProgress: inProgress)
+            inProgress: inProgress,
+            motionDroppedSampleEstimate: motionGaps.dropped,
+            accelDroppedSampleEstimate: accelGaps.dropped,
+            motionNonMonotonicCount: motionGaps.nonMonotonic,
+            accelNonMonotonicCount: accelGaps.nonMonotonic,
+            csvRowsLost: rowsLost,
+            gpsStaleFixesSkipped: session.gpsStaleSkipped.current)
     }
 
     private func writeMetadata(_ metadata: SessionMetadata, to folderURL: URL) throws {
@@ -689,15 +794,25 @@ extension SessionRecorder: CLLocationManagerDelegate {
             // start; fixes can be delivered late, and the fix time is what
             // aligns with reality.
             let t = location.timestamp.timeIntervalSince(session.startDate)
+            // CoreLocation commonly hands over its last cached fix first,
+            // stamped minutes or hours before the session began. That is a
+            // fix from before the session, not a filtered value, so it is
+            // skipped (and counted) rather than written with a negative t.
+            guard t >= 0 else {
+                session.gpsStaleSkipped.increment()
+                continue
+            }
             let coordinate = location.coordinate
             session.gpsWriter.appendRow(String(
-                format: "%.6f,%.8f,%.8f,%.3f,%.2f,%.2f",
+                format: "%.6f,%.8f,%.8f,%.3f,%.2f,%.2f,%.3f,%.2f",
                 t,
                 coordinate.latitude,
                 coordinate.longitude,
                 location.speed,
                 location.horizontalAccuracy,
-                location.altitude))
+                location.altitude,
+                location.speedAccuracy,
+                location.verticalAccuracy))
             session.gpsCounter.increment()
         }
     }

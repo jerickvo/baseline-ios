@@ -17,10 +17,10 @@ struct SessionDetailView: View {
                     .foregroundColor(.red)
                 }
             }
-            if metadata.totalGapCount > 0 {
+            if !metadata.isContinuous {
                 Section {
                     Label(
-                        "This session has gaps. Check the integrity numbers below before analyzing it.",
+                        metadata.integritySummary,
                         systemImage: "exclamationmark.triangle.fill")
                     .foregroundColor(.orange)
                 }
@@ -45,6 +45,11 @@ struct SessionDetailView: View {
                 LabeledContent("Motion gaps", value: "\(metadata.motionGapCount)")
                 LabeledContent("Accel gaps", value: "\(metadata.accelGapCount)")
                 LabeledContent("Largest gap", value: SessionFormat.seconds(metadata.largestGapSeconds))
+                LabeledContent("Motion dropped (est.)", value: "\(metadata.motionDroppedSampleEstimate ?? 0)")
+                LabeledContent("Accel dropped (est.)", value: "\(metadata.accelDroppedSampleEstimate ?? 0)")
+                LabeledContent("Duplicated/reordered", value: "\(metadata.totalNonMonotonicCount)")
+                LabeledContent("Rows lost to disk", value: "\(metadata.csvRowsLost ?? 0)")
+                LabeledContent("Stale GPS fixes skipped", value: "\(metadata.gpsStaleFixesSkipped ?? 0)")
             }
             Section("Device") {
                 LabeledContent("Model", value: metadata.deviceModel)
