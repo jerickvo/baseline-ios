@@ -89,7 +89,7 @@ enum RecorderStartError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .locationAccessDenied:
-            return "Recording needs location access. The background location session is the only thing that keeps motion capture running once the screen locks — without it iOS suspends the app and the recording silently stops. Enable Always location for BaselineLogger in Settings."
+            return "Recording needs location access. The background location session is the only thing that keeps motion capture running once the screen locks — without it iOS suspends the app and the recording silently stops. Enable location access for BaselineLogger in Settings (While Using is sufficient)."
         case .deviceMotionUnavailable:
             return "Device motion is not available on this device, so there would be no motion.csv."
         case .accelerometerUnavailable:
@@ -230,7 +230,9 @@ final class SessionRecorder: NSObject, ObservableObject {
 
     /// Two-step ladder: When-In-Use first, then escalate to Always (the
     /// escalation happens in locationManagerDidChangeAuthorization). Always is
-    /// required for capture to survive the screen locking mid-run.
+    /// requested so capture does not depend on a foreground start; When-In-Use
+    /// plus the location background mode keeps a foreground-started session
+    /// alive after the screen locks (see updateAuthWarning and the README).
     func requestPermissions() {
         switch locationManager.authorizationStatus {
         case .notDetermined:
@@ -776,8 +778,10 @@ final class SessionRecorder: NSObject, ObservableObject {
 extension SessionRecorder: CLLocationManagerDelegate {
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        // Escalate When-In-Use to Always as soon as it is granted; Always is
-        // what lets the session keep recording after the screen locks.
+        // Escalate When-In-Use to Always as soon as it is granted. Always is
+        // not what keeps a foreground-started session alive after lock (the
+        // background location session does that under When-In-Use); it
+        // removes the dependency on a foreground start.
         if manager.authorizationStatus == .authorizedWhenInUse {
             manager.requestAlwaysAuthorization()
         }
@@ -804,7 +808,10 @@ extension SessionRecorder: CLLocationManagerDelegate {
             }
             let coordinate = location.coordinate
             session.gpsWriter.appendRow(String(
-                format: "%.6f,%.8f,%.8f,%.3f,%.2f,%.2f,%.3f,%.2f",
+                // Six decimals of latitude/longitude is ~0.1 m, finer than
+                // any GPS fix and all a pace model could use; eight was
+                // ~1 mm of a track that starts and ends at the runner's door.
+                format: "%.6f,%.6f,%.6f,%.3f,%.2f,%.2f,%.3f,%.2f",
                 t,
                 coordinate.latitude,
                 coordinate.longitude,

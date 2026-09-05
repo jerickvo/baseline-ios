@@ -74,8 +74,8 @@ when you open the project.
 With the screen off, iOS suspends apps and motion updates stop **with no
 error**. BaselineLogger stays alive by:
 
-1. Requesting **Always** location authorization (two-step ladder: When-In-Use
-   first, then Always).
+1. Requesting location authorization (When-In-Use; Always is then requested
+   optionally — see the note below on why it is not what keeps capture alive).
 2. Starting a continuous location session (`kCLLocationAccuracyBest`,
    `allowsBackgroundLocationUpdates = true`,
    `pausesLocationUpdatesAutomatically = false`) **before** motion updates,
@@ -238,7 +238,7 @@ columns existed have six columns; load by column name.
 | `startTime` / `endTime` | ISO 8601 wall-clock timestamps |
 | `durationSeconds` | Measured on the monotonic clock |
 | `motionSampleCount` / `accelSampleCount` / `gpsSampleCount` | Rows written per CSV |
-| `achievedMotionHz` / `achievedAccelHz` | sample count / duration — compare against 100 / 200 |
+| `achievedMotionHz` / `achievedAccelHz` | sample count / whole-session duration, sensor spin-up included, so a short session reads slightly low (~1% at 30 s). A coarse check against 100 / 200; the Python loader measures the real rate from the per-sample `t`. |
 | `deviceModel` | Hardware identifier, e.g. `iPhone15,2` |
 | `iosVersion` | e.g. `17.5.1` |
 | `motionGapCount` / `accelGapCount` | Number of gaps per stream (see below) |
@@ -251,7 +251,11 @@ columns existed have six columns; load by column name.
 | `gpsStaleFixesSkipped` | Cached fixes stamped before session start, not written to gps.csv. |
 
 The last four are absent from files written before they existed. The
-Python loader treats a session as clean only when all four are zero.
+Python loader reads all four: `csvRowsLost > 0` and a `motionSampleCount`
+that does not match the rows in motion.csv are blockers, the dropped and
+non-monotonic counts are cross-checked against its own measurement from
+`t`, and the stale-fix count is carried into the session's integrity
+record.
 
 **Gap definition:** any delta between consecutive sample timestamps greater
 than **3x the interval the stream is actually delivering** counts as one gap.
@@ -265,9 +269,18 @@ gap rule counts neither. So the tracker also converts any interval beyond
 1.5x the median into an estimate of samples missing (`round(delta / median)
 - 1`) and reports that separately. A stream can shed a sample every few
 seconds with `gapCount = 0`; it cannot do so with
-`droppedSampleEstimate = 0`. During a genuine rate change the estimate
-counts the transition until the threshold recalibrates (at most 128
-deltas), which is an honest upper bound rather than a false gap.
+`droppedSampleEstimate = 0`. During a genuine mid-session change in the
+delivered rate the threshold lags by 65-128 deltas (a 128-delta median
+window recalibrated every 64). In that lag a slow-down of *more* than 3x
+is reported as one gap per sample, and for the same lag after the rate
+recovers a real gap shorter than 3x the slow interval is counted only in
+`droppedSampleEstimate`. A rate change therefore shows up as a burst of
+gaps or dropped samples rather than being missed, and a session with one
+is still flagged; the split between the two counters is not exact across
+the change. The Python loader recomputes both from `t` with a single
+whole-record median, so across a rate change beyond 3x it reports every
+slow-section delta as a gap where the app reports only the lag window;
+the two agree on a steady stream, and both refuse the session.
 
 This matters because the threshold is deliberately *not* anchored to the
 requested rate. At 3x the requested 1/200 s accel interval, any device
@@ -280,6 +293,21 @@ gaps in the window cannot inflate the threshold meant to detect them.
 
 Gap counts and the largest gap are shown on screen the moment a session ends
 and flagged with a warning icon in the session list.
+
+### What a session folder reveals
+
+`gps.csv` is a full position track at ~1 Hz, from the first fix to the last,
+which for most runs means the runner's front door at both ends. It is stored
+in the app's Documents folder, which Finder file sharing exposes, and every
+export from the session list zips the whole folder, gps.csv included. Nothing
+leaves the phone on its own — there is no network code, no analytics and no
+logging in the app — but treat an exported session as a location record and
+share it accordingly. Coordinates are written to six decimals (about 0.1 m).
+
+`PrivacyInfo.xcprivacy` declares the one "required reason" API the app uses,
+`ProcessInfo.systemUptime` (category `NSPrivacyAccessedAPICategorySystemBootTime`,
+reason 35F9.1: measuring elapsed time within the app). It is the sample and
+marker clock, and App Store submission requires the declaration.
 
 Loading in Python — use the analysis repo's loader rather than reading the
 CSV directly. It measures the sample rate from `t`, recomputes gaps and

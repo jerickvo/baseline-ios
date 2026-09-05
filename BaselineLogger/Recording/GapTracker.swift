@@ -44,10 +44,15 @@ struct GapTracker {
     /// classified, then classified retroactively once the threshold is known,
     /// so warm-up samples are measured by the same rule as everything else.
     private static let warmupDeltas = 128
-    /// Bounded so memory stays flat: 256 Doubles (~2 KB) per stream, whatever
-    /// the session length.
-    private static let windowSize = 256
-    private static let recalibrateEvery = 128
+    /// Bounded so memory stays flat: 128 Doubles (~1 KB) per stream, whatever
+    /// the session length. The window is recalibrated every half-window so
+    /// that after a change in the delivered rate the median moves within
+    /// 65-128 deltas -- with a 256 window and 128 recalibration it took
+    /// 128-256, because the new rate had to fill more than half of a window
+    /// twice as long, and during that lag a >3x slow-down was reported as one
+    /// gap per sample.
+    private static let windowSize = 128
+    private static let recalibrateEvery = 64
     /// Multiples of the median interval: beyond `gapMultiple` is a gap;
     /// beyond `droppedMultiple` samples are estimated missing. 1.5 sits
     /// halfway between a normal interval (1x plus a few percent of jitter)

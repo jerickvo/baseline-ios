@@ -31,7 +31,7 @@
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>Always access lets a recording keep running with the screen off and the phone locked. The background location session is what keeps sensor capture alive for the whole run.</string>
+	<string>Always access lets a recording continue even if it was not started with the app in the foreground. Sessions started from the app keep recording after the screen locks with While Using access alone.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>GPS position and speed are recorded alongside motion data during a session.</string>
 	<key>NSMotionUsageDescription</key>
