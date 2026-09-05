@@ -665,9 +665,14 @@ final class SessionRecorder: NSObject, ObservableObject {
     private func writeInProgressMetadata(for session: ActiveSession, elapsed: TimeInterval) {
         let rowsLost = [session.motionWriter, session.accelWriter, session.gpsWriter]
             .reduce(0) { $0 + $1.failureState.rowsLost }
+        // Wall clock for endTime and the uptime clock for durationSeconds,
+        // deliberately from two clocks: their difference is the only record
+        // of the uptime clock pausing mid-session (which would shift gps.csv,
+        // on wall time, against motion.csv, on uptime, with no gap to show
+        // for it). The Python loader reports that skew.
         let metadata = metadataSnapshot(
             for: session,
-            endDate: session.startDate.addingTimeInterval(elapsed),
+            endDate: Date(),
             duration: elapsed,
             motionGaps: session.motionGapStats.current,
             accelGaps: session.accelGapStats.current,

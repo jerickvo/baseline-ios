@@ -170,9 +170,14 @@ inter-sample deltas are exact. For `gps.csv`, `t` is derived from the fix's
 wall-clock timestamp relative to session start — fixes are timestamped at
 measurement, not delivery. The two origins (`Date()` and `systemUptime`) are
 read back to back before any file is created, so the streams share a `t = 0`
-to within microseconds. A mid-session NTP clock adjustment could still shift
-GPS `t` slightly; it can never shift motion/accel `t`, which ride the
-monotonic clock.
+to within microseconds. Two things can pull the streams apart afterwards: a
+mid-session NTP adjustment shifts GPS `t` slightly, and a pause of the
+uptime clock (the device sleeping; unlikely while the location session holds
+it awake, and unverified) shifts every later GPS row against motion with no
+gap in motion.csv to show for it. Both writes of `session.json` therefore
+record `endTime` from the wall clock and `durationSeconds` from the uptime
+clock, so `(endTime − startTime) − durationSeconds` is the accumulated skew;
+the Python loader reports it and flags more than half a second.
 
 ### motion.csv — fused device motion, requested at 100 Hz
 
