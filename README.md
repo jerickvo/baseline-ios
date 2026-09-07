@@ -9,8 +9,17 @@ the entire scope: **no analysis, no charts, no metrics, no step detection, no
 filtering happen on the phone.** Raw values only — nothing is smoothed,
 resampled, or interpolated on write.
 
-Data continuity is the top priority. The app tracks inter-sample gaps and
-reports them prominently, because a session with dropped samples is worthless.
+Data continuity is the top priority. The app tracks inter-sample gaps, samples
+dropped below the gap threshold, duplicated or reordered samples, and rows
+that never reached disk, and reports all of them prominently, because a
+session with missing samples is worthless.
+
+> **Build status.** The changes from the September 2026 audit (integrity
+> counters, marker timing, stale-fix filtering, write-failure surfacing,
+> the stop-race guard, GPS accuracy columns) were made by static review on a
+> machine with no Swift toolchain. They have not been compiled or run on a
+> device. Build in Xcode and do a locked-screen test run before trusting a
+> long session.
 
 ## Project layout
 
@@ -51,7 +60,7 @@ nothing needs to be added by hand. For reference:
 | --- | --- |
 | `NSMotionUsageDescription` | Motion data usage string. |
 | `NSLocationWhenInUseUsageDescription` | First step of the permission ladder. |
-| `NSLocationAlwaysAndWhenInUseUsageDescription` | Always access — required for recording to survive the screen locking. |
+| `NSLocationAlwaysAndWhenInUseUsageDescription` | Always access — requested so capture does not depend on the session having been started in the foreground. See the note on When-In-Use below. |
 | `UIBackgroundModes = [location]` | **Do not remove.** CoreMotion has no background mode of its own. The active background location session is the only thing that keeps the app running — and motion callbacks flowing — once the screen locks. Removing this silently kills every recording at screen-off. |
 | `UIFileSharingEnabled` | Exposes Documents in Finder device file sharing. |
 | `LSSupportsOpeningDocumentsInPlace` | Exposes Documents in the Files app. |
@@ -65,8 +74,8 @@ when you open the project.
 With the screen off, iOS suspends apps and motion updates stop **with no
 error**. BaselineLogger stays alive by:
 
-1. Requesting **Always** location authorization (two-step ladder: When-In-Use
-   first, then Always).
+1. Requesting location authorization (When-In-Use; Always is then requested
+   optionally — see the note below on why it is not what keeps capture alive).
 2. Starting a continuous location session (`kCLLocationAccuracyBest`,
    `allowsBackgroundLocationUpdates = true`,
    `pausesLocationUpdatesAutomatically = false`) **before** motion updates,
@@ -77,7 +86,18 @@ error**. BaselineLogger stays alive by:
 
 The idle timer is deliberately not disabled — the screen is supposed to turn
 off. On first run, grant location access, and when iOS later asks to upgrade
-to "Always Allow", accept — otherwise recording dies when the phone locks.
+to "Always Allow", accept.
+
+**On When-In-Use vs Always.** With the location background mode and
+`allowsBackgroundLocationUpdates = true`, a location session started while
+the app is in the foreground continues after the screen locks under
+When-In-Use authorization alone, with the system location indicator showing.
+Always is therefore not believed to be strictly required on iOS 16 for the
+way this app starts sessions; it is requested because it removes that
+dependency on a foreground start and costs nothing. This has not been
+verified on a device by the audit that wrote this paragraph. Do one
+locked-screen test run under each authorization level and check
+`achievedMotionHz` in `session.json` before relying on either.
 
 **Recording refuses to start without location access.** If authorization is
 denied or restricted, Start does nothing except show an error: there is no
@@ -117,11 +137,13 @@ duration and gaps are up to 30 s stale and the CSVs end wherever the app died.
 - Type a session label before starting (e.g. `normal 3mi`,
   `heel lift left 3mi`). Labels drive the downstream validation protocol.
 - **Mark Event** appends a timestamped marker with an optional note — drop
-  markers at lap boundaries. Markers land in `session.json`, on the same
-  timeline as the CSV `t` column.
+  markers at lap boundaries. The marker is stamped **at the moment you tap
+  Mark Event**, not when you finish typing the note, so take your time with
+  the note. Markers land in `session.json`, on the same timeline as the CSV
+  `t` column.
 - When you stop, a summary shows duration, sample counts, achieved rates,
-  gap count, and largest gap. **If gap count is non-zero, distrust the
-  session** before building analysis on it.
+  and the four integrity counters. **If the summary says anything other
+  than "Continuous", distrust the session** before building analysis on it.
 
 ## Pulling data off the device
 
@@ -148,21 +170,34 @@ inter-sample deltas are exact. For `gps.csv`, `t` is derived from the fix's
 wall-clock timestamp relative to session start — fixes are timestamped at
 measurement, not delivery. The two origins (`Date()` and `systemUptime`) are
 read back to back before any file is created, so the streams share a `t = 0`
-to within microseconds. A mid-session NTP clock adjustment could still shift
-GPS `t` slightly; it can never shift motion/accel `t`, which ride the
-monotonic clock.
+to within microseconds. Two things can pull the streams apart afterwards: a
+mid-session NTP adjustment shifts GPS `t` slightly, and a pause of the
+uptime clock (the device sleeping; unlikely while the location session holds
+it awake, and unverified) shifts every later GPS row against motion with no
+gap in motion.csv to show for it. Both writes of `session.json` therefore
+record `endTime` from the wall clock and `durationSeconds` from the uptime
+clock, so `(endTime − startTime) − durationSeconds` is the accumulated skew;
+the Python loader reports it and flags more than half a second.
 
 ### motion.csv — fused device motion, requested at 100 Hz
 
 `CMMotionManager.startDeviceMotionUpdates`, reference frame
 `.xArbitraryZVertical` (gravity pins Z; X arbitrary; no magnetometer).
 
+**Frames.** `ax..az`, `gx..gz` and `rx..rz` are all expressed in the
+**device (body) frame** — the phone's own axes, whatever way it is mounted.
+The reference frame named above applies **only** to the quaternion, which
+rotates device coordinates into it. That is what the downstream pipeline
+needs: it resolves the anatomical frame from `gx..gz` itself. (Sanity check
+for any consumer: rotating `g` by the quaternion must give approximately
+`(0, 0, -1)`.)
+
 | Column | Meaning | Units |
 | --- | --- | --- |
 | `t` | Seconds since session start | s |
-| `ax ay az` | `userAcceleration` — gravity already removed | g |
-| `gx gy gz` | `gravity` vector | g |
-| `rx ry rz` | `rotationRate` (bias-corrected) | rad/s |
+| `ax ay az` | `userAcceleration` — gravity already removed, device frame | g |
+| `gx gy gz` | `gravity` vector, device frame | g |
+| `rx ry rz` | `rotationRate` (bias-corrected), device frame | rad/s |
 | `qw qx qy qz` | `attitude` quaternion (device → reference frame) | unitless |
 
 ### accel_raw.csv — raw accelerometer, requested at 200 Hz
@@ -170,7 +205,11 @@ monotonic clock.
 Unfused and **includes gravity**. Exists because impact rise time lives in
 high-frequency content that 100 Hz device motion smooths out; used only for
 impact shape. Some devices will not sustain 200 Hz — the stream records
-whatever arrives, and the achieved rate is in `session.json`.
+whatever arrives, and the achieved rate is in `session.json`. **Check it:**
+if `achievedAccelHz` is not well above 100, this file carries no more
+bandwidth than `motion.csv` and its reason for existing is unmet on that
+device. Whether any iPhone actually delivers 200 Hz through
+`CMMotionManager` has not been verified here.
 
 | Column | Meaning | Units |
 | --- | --- | --- |
@@ -186,6 +225,14 @@ whatever arrives, and the achieved rate is in `session.json`.
 | `speed` | Instantaneous ground speed; **-1 when invalid** (raw, unfiltered) | m/s |
 | `horizontalAccuracy` | Radius of uncertainty; negative when invalid | m |
 | `altitude` | Above mean sea level | m |
+| `speedAccuracy` | 1-sigma uncertainty of `speed`; **negative when `speed` is invalid** | m/s |
+| `verticalAccuracy` | Uncertainty of `altitude`; **negative when `altitude` is invalid** | m |
+
+CoreLocation usually delivers its last *cached* fix first, stamped minutes or
+hours before the session began. Those fixes are skipped (they would carry a
+negative `t`) and counted in `session.json` as `gpsStaleFixesSkipped`, so
+`t` in this file is never negative. Files written before the two accuracy
+columns existed have six columns; load by column name.
 
 ### session.json
 
@@ -196,19 +243,49 @@ whatever arrives, and the achieved rate is in `session.json`.
 | `startTime` / `endTime` | ISO 8601 wall-clock timestamps |
 | `durationSeconds` | Measured on the monotonic clock |
 | `motionSampleCount` / `accelSampleCount` / `gpsSampleCount` | Rows written per CSV |
-| `achievedMotionHz` / `achievedAccelHz` | sample count / duration — compare against 100 / 200 |
+| `achievedMotionHz` / `achievedAccelHz` | sample count / whole-session duration, sensor spin-up included, so a short session reads slightly low (~1% at 30 s). A coarse check against 100 / 200; the Python loader measures the real rate from the per-sample `t`. |
 | `deviceModel` | Hardware identifier, e.g. `iPhone15,2` |
 | `iosVersion` | e.g. `17.5.1` |
 | `motionGapCount` / `accelGapCount` | Number of gaps per stream (see below) |
 | `largestGapSeconds` | Largest single gap across both streams |
 | `eventMarkers` | Array of `{t, note}` on the CSV `t` timeline |
 | `inProgress` | `true` while a session is unfinalized. session.json is written at start and refreshed every 30 s, so a run killed mid-session still leaves metadata; stop rewrites the file with this `false`. Absent in files written before this field existed — those are complete. |
+| `motionDroppedSampleEstimate` / `accelDroppedSampleEstimate` | Samples estimated missing from intervals that were long but **below** the gap threshold. See "Gap definition". |
+| `motionNonMonotonicCount` / `accelNonMonotonicCount` | Duplicated or reordered samples (zero or negative timestamp delta). |
+| `csvRowsLost` | Rows the sample counters credited that never reached disk (a failed flush discards its whole buffer). |
+| `gpsStaleFixesSkipped` | Cached fixes stamped before session start, not written to gps.csv. |
+
+The last four are absent from files written before they existed. The
+Python loader reads all four: `csvRowsLost > 0` and a `motionSampleCount`
+that does not match the rows in motion.csv are blockers, the dropped and
+non-monotonic counts are cross-checked against its own measurement from
+`t`, and the stale-fix count is carried into the session's integrity
+record.
 
 **Gap definition:** any delta between consecutive sample timestamps greater
 than **3x the interval the stream is actually delivering** counts as one gap.
 The threshold is measured, not assumed: after a 128-delta warm-up the tracker
 takes the median observed delta and uses 3x that, recalibrating every 128
 deltas (warm-up deltas are classified retroactively, so nothing is missed).
+
+**A gap count of zero was never proof of continuity.** One dropped sample
+makes a 2x interval and two consecutive dropped samples make exactly 3x — the
+gap rule counts neither. So the tracker also converts any interval beyond
+1.5x the median into an estimate of samples missing (`round(delta / median)
+- 1`) and reports that separately. A stream can shed a sample every few
+seconds with `gapCount = 0`; it cannot do so with
+`droppedSampleEstimate = 0`. During a genuine mid-session change in the
+delivered rate the threshold lags by 65-128 deltas (a 128-delta median
+window recalibrated every 64). In that lag a slow-down of *more* than 3x
+is reported as one gap per sample, and for the same lag after the rate
+recovers a real gap shorter than 3x the slow interval is counted only in
+`droppedSampleEstimate`. A rate change therefore shows up as a burst of
+gaps or dropped samples rather than being missed, and a session with one
+is still flagged; the split between the two counters is not exact across
+the change. The Python loader recomputes both from `t` with a single
+whole-record median, so across a rate change beyond 3x it reports every
+slow-section delta as a gap where the app reports only the lag window;
+the two agree on a steady stream, and both refuse the session.
 
 This matters because the threshold is deliberately *not* anchored to the
 requested rate. At 3x the requested 1/200 s accel interval, any device
@@ -222,12 +299,33 @@ gaps in the window cannot inflate the threshold meant to detect them.
 Gap counts and the largest gap are shown on screen the moment a session ends
 and flagged with a warning icon in the session list.
 
-Loading in Python:
+### What a session folder reveals
+
+`gps.csv` is a full position track at ~1 Hz, from the first fix to the last,
+which for most runs means the runner's front door at both ends. It is stored
+in the app's Documents folder, which Finder file sharing exposes, and every
+export from the session list zips the whole folder, gps.csv included. Nothing
+leaves the phone on its own — there is no network code, no analytics and no
+logging in the app — but treat an exported session as a location record and
+share it accordingly. Coordinates are written to six decimals (about 0.1 m).
+
+`PrivacyInfo.xcprivacy` declares the one "required reason" API the app uses,
+`ProcessInfo.systemUptime` (category `NSPrivacyAccessedAPICategorySystemBootTime`,
+reason 35F9.1: measuring elapsed time within the app). It is the sample and
+marker clock, and App Store submission requires the declaration.
+
+Loading in Python — use the analysis repo's loader rather than reading the
+CSV directly. It measures the sample rate from `t`, recomputes gaps and
+dropped samples independently of `session.json`, drops invalid GPS rows, and
+runs the quality gate:
 
 ```python
-import pandas as pd
-motion = pd.read_csv("20260828T134502Z/motion.csv")
+from src import pipeline           # jerickvo/baseline-analysis
+result = pipeline.run_session("20260828T134502Z")
+print(result["quality"]["verdict"])   # "ok" | "partial" | "insufficient"
 ```
+
+or from a shell: `python scripts/run_session.py 20260828T134502Z`.
 
 ## Constraints (by design)
 

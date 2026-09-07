@@ -10,17 +10,11 @@ struct SessionSummaryView: View {
         NavigationStack {
             List {
                 Section {
-                    if metadata.totalGapCount > 0 {
-                        Label(
-                            "\(metadata.totalGapCount) gap(s) detected — largest \(SessionFormat.seconds(metadata.largestGapSeconds)). Treat this session with suspicion.",
-                            systemImage: "exclamationmark.triangle.fill")
-                        .foregroundColor(.orange)
-                    } else {
-                        Label(
-                            "Continuous — no gaps detected.",
-                            systemImage: "checkmark.circle.fill")
-                        .foregroundColor(.green)
-                    }
+                    Label(
+                        metadata.integritySummary,
+                        systemImage: metadata.isContinuous
+                            ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                    .foregroundColor(metadata.isContinuous ? .green : .orange)
                 }
                 Section("Session") {
                     LabeledContent("Label", value: metadata.label.isEmpty ? "—" : metadata.label)
@@ -39,6 +33,9 @@ struct SessionSummaryView: View {
                     LabeledContent("Motion gaps", value: "\(metadata.motionGapCount)")
                     LabeledContent("Accel gaps", value: "\(metadata.accelGapCount)")
                     LabeledContent("Largest gap", value: SessionFormat.seconds(metadata.largestGapSeconds))
+                    LabeledContent("Dropped samples (est.)", value: "\(metadata.totalDroppedSampleEstimate)")
+                    LabeledContent("Duplicated/reordered", value: "\(metadata.totalNonMonotonicCount)")
+                    LabeledContent("Rows lost to disk", value: "\(metadata.csvRowsLost ?? 0)")
                 }
                 if !metadata.eventMarkers.isEmpty {
                     Section("Event markers") {

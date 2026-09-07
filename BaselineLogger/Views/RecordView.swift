@@ -8,6 +8,10 @@ struct RecordView: View {
     @State private var label = ""
     @State private var showMarkAlert = false
     @State private var markNote = ""
+    /// Session time captured the instant Mark Event was tapped, so the
+    /// marker lands where the tap happened rather than where the note was
+    /// finished.
+    @State private var pendingMarkTime: TimeInterval?
 
     var body: some View {
         NavigationStack {
@@ -33,14 +37,18 @@ struct RecordView: View {
         .alert("Mark Event", isPresented: $showMarkAlert) {
             TextField("Note (optional)", text: $markNote)
             Button("Mark") {
-                recorder.markEvent(note: markNote)
+                if let t = pendingMarkTime {
+                    recorder.markEvent(at: t, note: markNote)
+                }
                 markNote = ""
+                pendingMarkTime = nil
             }
             Button("Cancel", role: .cancel) {
                 markNote = ""
+                pendingMarkTime = nil
             }
         } message: {
-            Text("Appends a timestamped marker to this session.")
+            Text("The marker is stamped at the moment you tapped Mark Event.")
         }
     }
 
@@ -112,6 +120,7 @@ struct RecordView: View {
 
     private var markEventButton: some View {
         Button {
+            pendingMarkTime = recorder.currentSessionTime()
             showMarkAlert = true
         } label: {
             Label("Mark Event", systemImage: "flag")
